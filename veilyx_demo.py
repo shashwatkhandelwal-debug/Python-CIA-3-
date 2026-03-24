@@ -1,393 +1,383 @@
-"""
-Veilyx - Identity Verification Demo
-------------------------------------
-Simulates a single user verifying their identity using
-an Aadhaar Offline XML (as downloaded from DigiLocker).
-
-Flow:
-1. Load Aadhaar XML (mock or real file)
-2. Verify UIDAI digital signature
-3. Parse identity attributes
-4. Generate cryptographic proof
-5. Verify proof on backend
-6. Return result
-
-Run: python veilyx_demo.py
-"""
-
-import xml.etree.ElementTree as ET
-import hashlib
-import hmac
-import json
-import time
-import secrets
-import base64
+import math
 import os
+import json
 from datetime import datetime
 
-# ── COLORS FOR TERMINAL ───────────────────────────────────────
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-ORANGE = "\033[93m"
-BLUE   = "\033[94m"
-GRAY   = "\033[90m"
-BOLD   = "\033[1m"
-RESET  = "\033[0m"
+GREEN   = "\033[92m"
+RED     = "\033[91m"
+YELLOW  = "\033[93m"
+CYAN    = "\033[96m"
+WHITE   = "\033[97m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+MAGENTA = "\033[95m"
+RESET   = "\033[0m"
 
-def log(msg, color=RESET):     print(f"{color}{msg}{RESET}")
-def ok(msg):                   log(f"  [OK]  {msg}", GREEN)
-def fail(msg):                 log(f"  [FAIL] {msg}", RED)
-def info(msg):                 log(f"  [>>]  {msg}", BLUE)
-def warn(msg):                 log(f"  [!!]  {msg}", ORANGE)
-def step(n, msg):              log(f"\n{BOLD}Step {n}: {msg}{RESET}")
+DATA_FILE = "investments.json"
 
-# ── MOCK AADHAAR XML ──────────────────────────────────────────
-# In production this comes from DigiLocker as a signed ZIP
-# The XML is signed by UIDAI using RSA-2048
-MOCK_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<OfflinePaperlessKyc referenceId="1234567890" ts="2025-03-14T10:30:00" txn="UIDTxn:abc123">
-  <UidData uid="xxxx-xxxx-xxxx-1234">
-    <Poi dob="1998-08-15" gender="M" name="Rahul Sharma" phone="xxxxxxx890"/>
-    <Poa co="" dist="New Delhi" house="42" landmark="Near Metro" 
-         loc="Lajpat Nagar" pc="110024" po="Lajpat Nagar" 
-         state="Delhi" street="Main Road" subdist="South Delhi" vtc="New Delhi"/>
-    <Pht>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==</Pht>
-  </UidData>
-  <Signature>
-    <SignatureValue>MOCK_UIDAI_RSA2048_SIGNATURE_BASE64_ENCODED==</SignatureValue>
-    <KeyInfo>
-      <X509Data>
-        <X509Certificate>MOCK_UIDAI_PUBLIC_CERTIFICATE==</X509Certificate>
-      </X509Data>
-    </KeyInfo>
-  </Signature>
-</OfflinePaperlessKyc>"""
+# ══════════════════════════════════════════════
+#  FILE HANDLING
+# ══════════════════════════════════════════════
 
-# ── MOCK DEVICE STORE (simulates AndroidKeyStore / Secure Enclave) ──
-class MockHardwareKeystore:
+def load_investments():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {"username": "Investor", "saved_plans": []}
+
+def save_investments(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+# ══════════════════════════════════════════════
+#  DISPLAY HELPERS
+# ══════════════════════════════════════════════
+
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def divider(char="─", width=60):
+    print(f"{DIM}{char * width}{RESET}")
+
+def header(title):
+    width = 60
+    print(f"\n{CYAN}{BOLD}{'═' * width}{RESET}")
+    pad = (width - len(title)) // 2
+    print(f"{CYAN}{BOLD}{' ' * pad}{title}{RESET}")
+    print(f"{CYAN}{'═' * width}{RESET}\n")
+
+# ══════════════════════════════════════════════
+#  CORE FORMULA FUNCTIONS
+# ══════════════════════════════════════════════
+
+def compound_interest(principal, rate, n, t):
     """
-    Simulates the hardware-backed key storage on Android/iOS.
-    In production:
-      - Android: AndroidKeyStore with StrongBox / TEE
-      - iOS: Secure Enclave via SecKeyCreateRandomKey
-    Private key NEVER leaves the hardware chip.
+    Formula: A = P * (1 + r/n)^(n*t)
+    P = principal, r = annual rate (decimal),
+    n = compounding frequency, t = time in years
     """
-    def __init__(self):
-        # Generate key pair (in production this stays inside the chip)
-        self.device_id = secrets.token_hex(16)
-        raw_key = secrets.token_bytes(32)
-        self._private_key = raw_key  # Never exposed in production
-        self.public_key = base64.b64encode(
-            hashlib.sha256(raw_key).digest()
-        ).decode()
+    amount   = principal * math.pow((1 + rate / n), n * t)
+    interest = amount - principal
+    return round(amount, 2), round(interest, 2)
 
-    def sign(self, payload: str) -> str:
-        """
-        Sign payload using hardware key.
-        In production: Signature.getInstance("SHA256withECDSA") in AndroidKeyStore
-        Here: HMAC-SHA256 as simulation
-        """
-        sig = hmac.new(
-            self._private_key,
-            payload.encode(),
-            hashlib.sha256
-        ).digest()
-        return base64.b64encode(sig).decode()
-
-    def verify_own_signature(self, payload: str, signature: str) -> bool:
-        expected = self.sign(payload)
-        return hmac.compare_digest(expected, signature)
-
-
-# ── UIDAI SIGNATURE VERIFICATION ─────────────────────────────
-def verify_uidai_signature(xml_content: str) -> tuple[bool, str]:
+def compound_with_monthly_sip(principal, monthly_sip, rate, n, t):
     """
-    Verify UIDAI's RSA-2048 digital signature on the Aadhaar XML.
-    
-    In production:
-      - Extract SignatureValue from XML
-      - Load UIDAI public certificate from KeyInfo
-      - Verify RSA-2048 / SHA-256 signature over signed content
-      - Uses cryptography library: public_key.verify(sig, content, PKCS1v15(), SHA256())
-    
-    Here: We check structure and flag mock signatures.
-    Returns: (is_valid, reason)
+    Combines lump sum + monthly deposit
+    SIP Future Value = SIP * [((1 + r/n)^(n*t) - 1) / (r/n)]
     """
+    lump_amount  = principal * math.pow((1 + rate / n), n * t)
+    r_per_period = rate / 12
+    periods      = int(t * 12)
+    if r_per_period > 0:
+        sip_amount = monthly_sip * ((math.pow(1 + r_per_period, periods) - 1) / r_per_period) * (1 + r_per_period)
+    else:
+        sip_amount = monthly_sip * periods
+    total          = lump_amount + sip_amount
+    total_invested = principal + (monthly_sip * periods)
+    interest       = total - total_invested
+    return round(total, 2), round(interest, 2), round(total_invested, 2)
+
+def yearly_breakdown(principal, rate, n, t):
+    """Return a list of (year, amount, interest_earned) for each year."""
+    breakdown = []
+    for year in range(1, int(t) + 1):
+        amount, interest = compound_interest(principal, rate, n, year)
+        breakdown.append({"year": year, "amount": amount, "interest": interest})
+    return breakdown
+
+# ══════════════════════════════════════════════
+#  ASCII BAR CHART
+# ══════════════════════════════════════════════
+
+def bar_chart(breakdown, principal):
+    """Year-by-year chart showing amount, yearly interest and monthly interest."""
+    max_amount = breakdown[-1]["amount"]
+    max_bar    = 25
+
+    print(f"\n  {BOLD}Year-by-Year Growth Chart{RESET}\n")
+    print(f"  {'YEAR':<6} {'AMOUNT':>14}  {'INT/YEAR':>11}  {'INT/MONTH':>11}  GROWTH BAR")
+    divider()
+
+    for entry in breakdown:
+        year             = entry["year"]
+        amount           = entry["amount"]
+        interest_yearly  = entry["interest"]
+        interest_monthly = round(interest_yearly / 12, 2)
+
+        pct     = amount / max_amount
+        bar_len = int(pct * max_bar)
+
+        if pct < 0.4:
+            color = YELLOW
+        elif pct < 0.75:
+            color = CYAN
+        else:
+            color = GREEN
+
+        bar = "█" * bar_len + f"{DIM}░{RESET}" * (max_bar - bar_len)
+
+        print(f"  Yr {year:<3} {BOLD}₹{amount:>12,.0f}{RESET}  "
+              f"{CYAN}₹{interest_yearly:>9,.2f}{RESET}  "
+              f"{MAGENTA}₹{interest_monthly:>9,.2f}{RESET}  "
+              f"{color}{bar}{RESET}")
+
+# ══════════════════════════════════════════════
+#  SPARKLINE
+# ══════════════════════════════════════════════
+
+def interest_sparkline(breakdown):
+    """Show how interest earned per year accelerates."""
+    yearly_gains = []
+    prev = 0
+    for entry in breakdown:
+        gain = entry["interest"] - prev
+        yearly_gains.append(gain)
+        prev = entry["interest"]
+
+    bars   = ["▁","▂","▃","▄","▅","▆","▇","█"]
+    lo     = min(yearly_gains)
+    hi     = max(yearly_gains)
+    spread = hi - lo if hi != lo else 1
+
+    line = ""
+    for g in yearly_gains:
+        idx   = int((g - lo) / spread * (len(bars) - 1))
+        line += bars[idx]
+
+    return f"{GREEN}{line}{RESET}  ← interest earned each year (accelerating!)"
+
+# ══════════════════════════════════════════════
+#  OPTION 1 — CALCULATOR
+# ══════════════════════════════════════════════
+
+def run_calculator(data):
+    header("  📐  COMPOUND INTEREST CALCULATOR")
+    print(f"  {DIM}All amounts in Indian Rupees (₹){RESET}\n")
+
     try:
-        root = ET.fromstring(xml_content)
-        sig_element = root.find(".//SignatureValue")
-        cert_element = root.find(".//X509Certificate")
+        principal   = float(input("  💰 Principal Amount (₹)                 : "))
+        rate_pct    = float(input("  📈 Annual Interest Rate (%)             : "))
+        years       = int(input("  📅 Investment Duration (years)          : "))
+        monthly_dep = float(input("  ➕ Monthly Deposit (₹/month, 0 if none) : "))
+    except ValueError:
+        print(f"\n  {RED}❌ Invalid input. Please enter numbers only.{RESET}")
+        return
 
-        if sig_element is None or cert_element is None:
-            return False, "Missing signature or certificate in XML"
+    if principal < 0 or rate_pct < 0 or years <= 0:
+        print(f"\n  {RED}❌ Principal and rate must be positive, years > 0.{RESET}")
+        return
 
-        sig_value = sig_element.text.strip()
+    rate = rate_pct / 100
 
-        # In production: actual RSA-2048 verification
-        # For demo: check it is not empty and flag mock
-        if "MOCK" in sig_value:
-            warn("Mock signature detected -- skipping RSA verification")
-            warn("In production: UIDAI RSA-2048 signature verified here")
-            return True, "Mock signature accepted for demo"
+    print(f"""
+  Compounding Frequency:
+  {CYAN}1.{RESET} Annually    {CYAN}2.{RESET} Quarterly
+  {CYAN}3.{RESET} Monthly     {CYAN}4.{RESET} Daily
+""")
+    freq_map    = {"1": 1, "2": 4, "3": 12, "4": 365}
+    freq_name   = {"1": "Annually", "2": "Quarterly", "3": "Monthly", "4": "Daily"}
+    freq_choice = input("  Choose (1-4): ").strip()
+    n           = freq_map.get(freq_choice, 12)
+    freq_label  = freq_name.get(freq_choice, "Monthly")
 
-        return True, "UIDAI signature verified"
+    clear()
+    header("  📊  YOUR INVESTMENT REPORT")
 
-    except ET.ParseError as e:
-        return False, f"XML parse error: {e}"
+    # ── CALCULATIONS ──
+    if monthly_dep > 0:
+        final, interest, invested = compound_with_monthly_sip(principal, monthly_dep, rate, n, years)
+        total_deposited = monthly_dep * years * 12
+    else:
+        final, interest = compound_interest(principal, rate, n, years)
+        invested        = principal
+        total_deposited = 0
 
+    breakdown        = yearly_breakdown(principal, rate, n, years)
+    growth_pct       = (interest / invested) * 100
+    interest_yearly  = round(interest / years, 2)
+    interest_monthly = round(interest / (years * 12), 2)
 
-# ── XML PARSER ────────────────────────────────────────────────
-def parse_aadhaar_xml(xml_content: str) -> dict | None:
-    """
-    Parse Aadhaar XML and extract identity attributes.
-    
-    In production (Android):
-      - XmlPullParser with XXE protection flags
-      - FEATURE_SECURE_PROCESSING = true
-      - External entity resolution disabled
-    
-    Returns dict with identity fields or None on failure.
-    """
+    # ── INPUT SUMMARY (no colour) ──
+    print(f"""
+  {BOLD}INPUT SUMMARY{RESET}
+  ┌──────────────────────────────────────────────────┐
+  │  Principal              :  ₹{principal:>15,.2f}             │
+  │  Monthly Deposit        :  ₹{monthly_dep:>15,.2f}             │
+  │  Total Deposited        :  ₹{total_deposited:>15,.2f}             │
+  │  Annual Rate            :  {rate_pct:>15.2f}%            │
+  │  Duration               :  {years:>14} years            │
+  │  Compounding            :  {freq_label:>15}            │
+  └──────────────────────────────────────────────────┘
+""")
+
+    # ── RESULTS (colour here) ──
+    print(f"""  {BOLD}RESULTS{RESET}
+  ┌──────────────────────────────────────────────────┐
+  │  Total Amount Invested  :  {YELLOW}₹{invested:>15,.2f}{RESET}             │
+  │                                                  │
+  │  Avg Interest / Month   :  {MAGENTA}₹{interest_monthly:>15,.2f}{RESET}             │
+  │  Avg Interest / Annum   :  {CYAN}₹{interest_yearly:>15,.2f}{RESET}             │
+  │  Total Interest Earned  :  {CYAN}₹{interest:>15,.2f}{RESET}             │
+  │                                                  │
+  │  {GREEN}{BOLD}Final Amount           :  ₹{final:>15,.2f}{RESET}             │
+  │  {GREEN}Wealth Growth          :  {growth_pct:>14.1f}%{RESET}             │
+  └──────────────────────────────────────────────────┘
+""")
+
+    # ── SPARKLINE ──
+    print(f"  📈  Interest Acceleration:")
+    print(f"  {interest_sparkline(breakdown)}\n")
+
+    # ── BAR CHART ──
+    if years <= 30:
+        bar_chart(breakdown, principal)
+    else:
+        sampled = [b for b in breakdown if b["year"] % 5 == 0]
+        bar_chart(sampled, principal)
+
+    # ── MONTHLY DEPOSIT BREAKDOWN ──
+    if monthly_dep > 0:
+        divider()
+        print(f"\n  {BOLD}Deposit Contribution Breakdown:{RESET}")
+        lump_final, _ = compound_interest(principal, rate, n, years)
+        dep_contribution = final - lump_final
+        lump_pct = lump_final / final * 100
+        dep_pct  = dep_contribution / final * 100
+        print(f"  Lump Sum grew to         : {GREEN}₹{lump_final:>12,.2f}{RESET}  ({lump_pct:.1f}%)")
+        print(f"  Monthly Deposits grew to : {CYAN}₹{dep_contribution:>12,.2f}{RESET}  ({dep_pct:.1f}%)")
+        print(f"  {YELLOW}💡 Even small monthly deposits make a huge difference!{RESET}")
+
+    # ── SAVE ──
+    divider()
+    save = input("\n  Save this plan? (y/n): ").strip().lower()
+    if save == "y":
+        plan_name = input("  Name this plan: ").strip()
+        plan = {
+            "name":        plan_name,
+            "principal":   principal,
+            "monthly_dep": monthly_dep,
+            "rate":        rate_pct,
+            "years":       years,
+            "freq":        freq_label,
+            "final":       final,
+            "interest":    interest,
+            "date_saved":  datetime.now().strftime("%d %b %Y")
+        }
+        data["saved_plans"].append(plan)
+        save_investments(data)
+        print(f"  {GREEN}✅  Plan '{plan_name}' saved!{RESET}")
+
+# ══════════════════════════════════════════════
+#  OPTION 2 — GOAL PLANNER
+# ══════════════════════════════════════════════
+
+def goal_planner():
+    header("  🎯  GOAL-BASED INVESTMENT PLANNER")
+    print(f"  {YELLOW}How much do you need to invest to reach your goal?{RESET}\n")
+
     try:
-        root = ET.fromstring(xml_content)
-        poi = root.find(".//Poi")
-        poa = root.find(".//Poa")
-
-        if poi is None:
-            return None
-
-        return {
-            "name":   poi.get("name", ""),
-            "dob":    poi.get("dob", ""),
-            "gender": poi.get("gender", ""),
-            "phone":  poi.get("phone", ""),
-            "dist":   poa.get("dist", "") if poa is not None else "",
-            "state":  poa.get("state", "") if poa is not None else "",
-            "pincode": poa.get("pc", "") if poa is not None else "",
-        }
-    except ET.ParseError:
-        return None
-
-
-# ── AGE CALCULATOR ────────────────────────────────────────────
-def calculate_age(dob_str: str) -> int | None:
-    """Calculate age from DOB string. Tries multiple formats."""
-    formats = ["%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"]
-    for fmt in formats:
-        try:
-            dob = datetime.strptime(dob_str, fmt)
-            today = datetime.today()
-            age = today.year - dob.year
-            if (today.month, today.day) < (dob.month, dob.day):
-                age -= 1
-            return age
-        except ValueError:
-            continue
-    return None
-
-
-# ── PROOF BUILDER ─────────────────────────────────────────────
-def build_proof(device: MockHardwareKeystore, company_id: str,
-                checks: dict, nonce: str) -> dict:
-    """
-    Build and sign a verification proof.
-    
-    In production:
-      - Payload constructed in VeilyxModule.kt / Veilyx.swift
-      - Signed inside AndroidKeyStore / Secure Enclave
-      - Private key never in app memory
-    """
-    payload = {
-        "device_id":    device.device_id,
-        "company_id":   company_id,
-        "checks":       checks,
-        "nonce":        nonce,
-        "timestamp":    int(time.time()),
-        "public_key":   device.public_key,
-    }
-    payload_str = json.dumps(payload, sort_keys=True)
-    signature = device.sign(payload_str)
-
-    return {
-        "payload":   payload,
-        "signature": signature,
-    }
-
-
-# ── MOCK BACKEND ──────────────────────────────────────────────
-class MockVeilyxBackend:
-    """
-    Simulates the Veilyx FastAPI backend.
-    
-    In production: FastAPI on Railway
-    Endpoints used here:
-      GET  /nonce   -> single-use nonce
-      POST /verify  -> verify signed proof
-    """
-    def __init__(self):
-        self.used_nonces = set()
-        self.verification_logs = []
-
-    def get_nonce(self) -> str:
-        """GET /nonce - single use, 300 second expiry"""
-        nonce = secrets.token_urlsafe(32)
-        return nonce
-
-    def verify(self, proof: dict, device: MockHardwareKeystore) -> dict:
-        """POST /verify"""
-        payload = proof["payload"]
-        signature = proof["signature"]
-        nonce = payload["nonce"]
-        timestamp = payload["timestamp"]
-
-        # Check 1: Nonce not reused (replay attack prevention)
-        if nonce in self.used_nonces:
-            return {"status": "REJECTED", "reason": "Nonce already used -- replay attack blocked"}
-
-        # Check 2: Timestamp freshness (300 second window)
-        age = int(time.time()) - timestamp
-        if age > 300:
-            return {"status": "REJECTED", "reason": f"Proof expired ({age}s old, max 300s)"}
-
-        # Check 3: Signature verification
-        payload_str = json.dumps(payload, sort_keys=True)
-        if not device.verify_own_signature(payload_str, signature):
-            return {"status": "REJECTED", "reason": "Invalid hardware signature"}
-
-        # Mark nonce as used immediately
-        self.used_nonces.add(nonce)
-
-        # Log verification (no identity data stored)
-        log_entry = {
-            "verification_id": secrets.token_hex(8),
-            "company_id":      payload["company_id"],
-            "device_id":       payload["device_id"],
-            "checks":          payload["checks"],
-            "status":          "VERIFIED",
-            "timestamp":       datetime.now().isoformat(),
-        }
-        self.verification_logs.append(log_entry)
-
-        return {
-            "status":          "VERIFIED",
-            "verification_id": log_entry["verification_id"],
-            "checks":          payload["checks"],
-            "cost_inr":        10,
-        }
-
-
-# ── MAIN DEMO ─────────────────────────────────────────────────
-def run():
-    log(f"\n{BOLD}{'='*55}{RESET}")
-    log(f"{BOLD}  VEILYX - Identity Verification Demo{RESET}")
-    log(f"{BOLD}{'='*55}{RESET}")
-    log(f"{GRAY}  Proofs, not documents. Zero storage.{RESET}\n")
-
-    # Setup
-    company_id = "demo-company-001"
-    device     = MockHardwareKeystore()
-    backend    = MockVeilyxBackend()
-
-    # Load XML
-    step(1, "Load Aadhaar XML from DigiLocker")
-    info("In production: user taps DigiLocker, XML downloaded in one tap")
-    xml_path = "aadhaar.xml"
-    if os.path.exists(xml_path):
-        with open(xml_path) as f:
-            xml_content = f.read()
-        ok(f"Loaded real XML from {xml_path}")
-    else:
-        xml_content = MOCK_XML
-        warn("No aadhaar.xml found -- using mock XML")
-        info("To use your real XML: save it as aadhaar.xml in this folder")
-
-    # Verify UIDAI signature
-    step(2, "Verify UIDAI Digital Signature (RSA-2048)")
-    info("Tampered XML has invalid signature -- rejected before parsing")
-    valid, reason = verify_uidai_signature(xml_content)
-    if not valid:
-        fail(f"Signature invalid: {reason}")
+        goal     = float(input("  🎯 Target Amount (₹)        : "))
+        rate_pct = float(input("  📈 Expected Annual Rate (%) : "))
+        years    = int(input("  📅 Time Available (years)   : "))
+    except ValueError:
+        print(f"\n  {RED}❌ Invalid input.{RESET}")
         return
-    ok(reason)
 
-    # Parse XML
-    step(3, "Parse XML On-Device")
-    info("No data leaves the device during this step")
-    identity = parse_aadhaar_xml(xml_content)
-    if not identity:
-        fail("Failed to parse Aadhaar XML")
+    if goal <= 0 or rate_pct <= 0 or years <= 0:
+        print(f"\n  {RED}❌ All values must be positive.{RESET}")
         return
-    ok(f"Name:    {identity['name']}")
-    ok(f"DOB:     {identity['dob']}")
-    ok(f"Gender:  {identity['gender']}")
-    ok(f"State:   {identity['state']}")
 
-    # Run checks
-    step(4, "Run Verification Checks")
-    age = calculate_age(identity["dob"])
-    checks = {}
+    rate = rate_pct / 100
 
-    if age is not None:
-        checks["age_above_18"] = age >= 18
-        checks["age_above_21"] = age >= 21
-        checks["calculated_age"] = age
-        ok(f"Age: {age} years")
-        ok(f"Age above 18: {checks['age_above_18']}")
-        ok(f"Age above 21: {checks['age_above_21']}")
+    # Reverse compound formula: P = A / (1 + r/n)^(n*t)
+    required_lump = goal / math.pow(1 + rate / 12, 12 * years)
+
+    # Monthly deposit required
+    r_monthly = rate / 12
+    periods   = years * 12
+    if r_monthly > 0:
+        required_monthly = goal * r_monthly / (math.pow(1 + r_monthly, periods) - 1)
     else:
-        fail("Could not parse date of birth")
-        checks["age_above_18"] = False
+        required_monthly = goal / periods
 
-    checks["gender_verified"] = identity["gender"] in ["M", "F", "T"]
-    checks["name_present"]    = len(identity["name"].strip()) > 0
-    ok(f"Identity checks complete")
+    total_deposited  = required_monthly * periods
+    interest_earned  = goal - total_deposited
+    interest_yearly  = round(interest_earned / years, 2)
+    interest_monthly = round(interest_earned / periods, 2)
 
-    # Fetch nonce
-    step(5, "Fetch Single-Use Nonce from Backend")
-    info("Nonce prevents replay attacks -- each proof is one-time use")
-    nonce = backend.get_nonce()
-    ok(f"Nonce received: {nonce[:20]}...")
+    # ── INPUT (no colour) ──
+    print(f"""
+  Your Goal              :  ₹{goal:,.2f}
+  Rate                   :  {rate_pct}% per year
+  Time                   :  {years} years
+""")
 
-    # Build and sign proof
-    step(6, "Build and Sign Proof in Hardware")
-    info("Signing happens inside TEE / Secure Enclave")
-    info("Private key never leaves the hardware chip")
-    proof = build_proof(device, company_id, checks, nonce)
-    ok(f"Device ID:  {device.device_id[:20]}...")
-    ok(f"Public key: {device.public_key[:20]}...")
-    ok(f"Signature:  {proof['signature'][:20]}...")
-    info("Aadhaar XML discarded after this step -- never sent to backend")
+    # ── OPTIONS & RESULTS (colour here) ──
+    print(f"""  {CYAN}{'═'*55}{RESET}
+  Option 1 — Invest a lump sum TODAY:
+    {GREEN}{BOLD}₹{required_lump:,.2f}{RESET}  →  grows to ₹{goal:,.0f} in {years} yrs
 
-    # Verify on backend
-    step(7, "Submit Proof to Veilyx Backend")
-    info("Backend verifies signature -- never sees Aadhaar XML")
-    result = backend.verify(proof, device)
+  Option 2 — Invest monthly:
+    {CYAN}{BOLD}₹{required_monthly:,.2f} / month{RESET}  →  grows to ₹{goal:,.0f} in {years} yrs
+  {CYAN}{'─'*55}{RESET}
 
-    # Result
-    log(f"\n{BOLD}{'='*55}{RESET}")
-    if result["status"] == "VERIFIED":
-        log(f"{BOLD}{GREEN}  RESULT: VERIFIED{RESET}")
-        ok(f"Verification ID: {result['verification_id']}")
-        ok(f"Age above 18:    {result['checks']['age_above_18']}")
-        ok(f"Age above 21:    {result['checks']['age_above_21']}")
-        ok(f"Cost charged:    Rs {result['cost_inr']}")
-    else:
-        log(f"{BOLD}{RED}  RESULT: REJECTED{RESET}")
-        fail(f"Reason: {result['reason']}")
+  {BOLD}If you go with monthly deposits:{RESET}
+  ┌──────────────────────────────────────────────────┐
+  │  Total Amount You Deposit :  {YELLOW}₹{total_deposited:>15,.2f}{RESET}             │
+  │                                                  │
+  │  Avg Interest / Month     :  {MAGENTA}₹{interest_monthly:>15,.2f}{RESET}             │
+  │  Avg Interest / Annum     :  {CYAN}₹{interest_yearly:>15,.2f}{RESET}             │
+  │  Total Interest Earned    :  {GREEN}₹{interest_earned:>15,.2f}{RESET}             │
+  │                                                  │
+  │  {GREEN}{BOLD}Final Amount             :  ₹{goal:>15,.2f}{RESET}             │
+  └──────────────────────────────────────────────────┘
 
-    log(f"{BOLD}{'='*55}{RESET}")
+  {YELLOW}💡 SIP lets you start small and let compounding do the work!{RESET}
+  {CYAN}{'═'*55}{RESET}
+""")
 
-    # Replay attack demo
-    log(f"\n{BOLD}Bonus: Replay Attack Test{RESET}")
-    info("Submitting same proof again -- should be blocked")
-    replay = backend.verify(proof, device)
-    if replay["status"] == "REJECTED":
-        ok(f"Replay blocked: {replay['reason']}")
-    else:
-        fail("Replay attack succeeded -- security issue")
+# ══════════════════════════════════════════════
+#  MAIN MENU
+# ══════════════════════════════════════════════
 
-    log(f"\n{GRAY}Zero documents stored. Zero Aadhaar data on server.{RESET}\n")
+def main():
+    data = load_investments()
 
+    if data.get("username") == "Investor":
+        clear()
+        print(f"\n{CYAN}{BOLD}  💰 Welcome to the Investment Simulator!{RESET}\n")
+        name = input("  Enter your name: ").strip()
+        if name:
+            data["username"] = name
+        save_investments(data)
+
+    while True:
+        clear()
+        print(f"""
+{CYAN}{BOLD}
+ ╔════════════════════════════════════════════════════════╗
+ ║    💰  COMPOUND INTEREST INVESTMENT SIMULATOR  💰      ║
+ ║         "Money makes money — and that money            ║
+ ║          makes more money."  — Benjamin Franklin       ║
+ ╚════════════════════════════════════════════════════════╝{RESET}
+  {DIM}Welcome, {RESET}{BOLD}{WHITE}{data["username"]}{RESET}
+
+  {GREEN}1.{RESET} 📐  Compound Interest Calculator  (with Monthly Deposit)
+  {CYAN}2.{RESET} 🎯  Goal-Based Planner  (find what you need to invest)
+  {DIM}3.{RESET} 🚪  Exit
+""")
+        divider()
+        choice = input("  Your choice (1–3): ").strip()
+
+        if   choice == "1": run_calculator(data)
+        elif choice == "2": goal_planner()
+        elif choice == "3":
+            print(f"\n  {GREEN}{BOLD}  Start early. Stay invested. Let compounding work! 🚀{RESET}\n")
+            break
+        else:
+            print(f"  {RED}❌ Invalid choice.{RESET}")
+
+        input(f"\n  {DIM}Press Enter to continue...{RESET}")
 
 if __name__ == "__main__":
-    run()
+    main()

@@ -1,10 +1,9 @@
 # Project Report: Compound Interest & SIP Investment Simulator
 
 **Institution:** Christ University, Delhi-NCR  
-**Course:** [Insert Course Name, e.g., Financial Management / Business Computing]  
-**Submitted By:** [Your Name]  
-**Registration Number:** [Your Roll/Reg Number]  
-**Date:** [Insert Date]  
+**Course:** Introduction to  Python for Business Analytics  
+**Submitted By:** Shashwat Khandelwal 25211248,Om Katiyar 25211266, Dev Avasthi 25211269, Anshdeep Arora 25211213, Shashank Yadav 25211261, Aditya Yadav 25211206
+**Date:** 21st March,2026 
 
 ---
 
